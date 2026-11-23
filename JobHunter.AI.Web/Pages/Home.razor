@@ -4,6 +4,7 @@
 @using JobHunter.AI.Web.Models
 @using JobHunter.AI.Web.Services
 @using Microsoft.AspNetCore.Components.Web
+@using System.Text.Json
 
 <!-- Job Description Panel -->
 <div class="analyze-grid">
@@ -262,9 +263,14 @@
             });
 
             if (response.IsSuccessStatusCode)
+            {
                 result = await response.Content.ReadFromJsonAsync<AnalyzeResult>();
+            }
             else
-                errorMessage = "Analysis failed. Please try again.";
+            {
+                var detail = await ReadProblemDetailAsync(response);
+                errorMessage = detail ?? "Analysis failed. Please try again.";
+            }
         }
         catch
         {
@@ -272,6 +278,27 @@
         }
 
         isAnalyzing = false;
+    }
+
+    private static async Task<string?> ReadProblemDetailAsync(HttpResponseMessage response)
+    {
+        try
+        {
+            var body = await response.Content.ReadAsStringAsync();
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.TryGetProperty("detail", out var detail) &&
+                detail.ValueKind == JsonValueKind.String &&
+                !string.IsNullOrWhiteSpace(detail.GetString()))
+            {
+                return detail.GetString();
+            }
+        }
+        catch
+        {
+            // Non-JSON body (e.g. HTML error page) — fall back to the generic message.
+        }
+
+        return null;
     }
 
     string BuildAnalysisSummary()

@@ -405,3 +405,7 @@ riderModule.iml
 codetree.txt
 
 codetree*.txt
+
+# Serena MCP (language server cache + local overrides; project.yml and memories/ are meant to be committed)
+.serena/cache/
+.serena/project.local.yml
