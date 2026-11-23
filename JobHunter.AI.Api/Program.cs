@@ -1,11 +1,11 @@
 using JobHunter.AI.Api.Agents;
+using JobHunter.AI.Api.Infrastructure;
 using JobHunter.AI.Api.Models;
 using JobHunter.AI.Api.Services;
 using JobHunter.AI.Api.Tools;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.AI;
 using Npgsql;
-using OllamaSharp;
 using AiChatMessage = Microsoft.Extensions.AI.ChatMessage;
 using AiChatResponse = Microsoft.Extensions.AI.ChatResponse;
 
@@ -21,16 +21,13 @@ builder.Services.AddCors(options =>
     options.AddDefaultPolicy(policy =>
         policy.WithOrigins(
                 "http://localhost:5150",
+                "https://localhost:7292",
                 "http://localhost:5065",
                 "http://localhost:80"
             )
             .AllowAnyHeader()
             .AllowAnyMethod());
 });
-
-var ollamaEndpoint = builder.Configuration["Ollama:Endpoint"] ?? "http://localhost:11434";
-var ollamaModel = builder.Configuration["Ollama:Model"] ?? "llama3.2:latest";
-var numCtx = builder.Configuration.GetValue<int>("Ollama:NumCtx", 8192);
 
 var connectionString = builder.Configuration.GetConnectionString("DefaultConnection")
                        ?? "Host=localhost;Database=jobassistant;Username=postgres;Password=postgres";
@@ -48,14 +45,13 @@ builder.Services.AddScoped<AtsEvaluationTools>();
 builder.Services.AddScoped<InterviewBankTools>();
 builder.Services.AddScoped<CareerAdvisorTools>();
 
-// Single IChatClient backed by OllamaSharp with context window middleware
+// LLM provider factory — reads Llm:Provider from config (Ollama | FreeModel | OpenAI)
+builder.Services.AddSingleton<IChatClientFactory, LlmClientFactory>();
 builder.Services.AddSingleton<IChatClient>(sp =>
 {
-    var ollamaClient = new OllamaApiClient(new Uri(ollamaEndpoint), ollamaModel);
-
-    return new ChatClientBuilder(ollamaClient)
-        .Use(inner => new OllamaNumCtxChatClient(inner, numCtx))
-        .Build();
+    var innerClient = sp.GetRequiredService<IChatClientFactory>().Create();
+    var retryLogger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("LlmRetry");
+    return new TransientRetryChatClient(innerClient, retryLogger);
 });
 
 // Deterministic AI & Pipeline Services
@@ -97,8 +93,15 @@ app.MapPost("/api/analyze", async (AnalyzeRequest request, [FromServices] AiAnal
     if (string.IsNullOrWhiteSpace(request.ResumeContent) || string.IsNullOrWhiteSpace(request.JobDescription))
         return Results.BadRequest("Resume and job description are required.");
 
-    var result = await analyzer.AnalyzeAsync(request.ResumeContent, request.JobDescription);
-    return result is null ? Results.Problem("Failed to analyze") : Results.Ok(result);
+    try
+    {
+        var result = await analyzer.AnalyzeAsync(request.ResumeContent, request.JobDescription);
+        return result is null ? Results.Problem("Failed to analyze") : Results.Ok(result);
+    }
+    catch (LlmProviderUnavailableException ex)
+    {
+        return Results.Problem(statusCode: 503, title: "LLM provider unavailable", detail: ex.Message);
+    }
 });
 
 app.MapPost("/api/analyze-by-id", async (
@@ -112,8 +115,15 @@ app.MapPost("/api/analyze-by-id", async (
     var resume = await resumeRepo.GetByIdAsync(req.ResumeId);
     if (resume is null) return Results.NotFound("Resume not found.");
 
-    var result = await analyzer.AnalyzeAsync(resume.Content, req.JobDescription);
-    return result is null ? Results.Problem("Failed to analyze") : Results.Ok(result);
+    try
+    {
+        var result = await analyzer.AnalyzeAsync(resume.Content, req.JobDescription);
+        return result is null ? Results.Problem("Failed to analyze") : Results.Ok(result);
+    }
+    catch (LlmProviderUnavailableException ex)
+    {
+        return Results.Problem(statusCode: 503, title: "LLM provider unavailable", detail: ex.Message);
+    }
 });
 
 app.MapPost("/api/tailor", async (TailorRequest request, [FromServices] ResumeTailorService tailorService) =>
@@ -264,21 +274,3 @@ await ApplicationRepository.InitDbAsync(dataSource);
 
 app.Run();
 
-public class OllamaNumCtxChatClient(IChatClient innerClient, int numCtx) : DelegatingChatClient(innerClient)
-{
-    public override Task<AiChatResponse> GetResponseAsync(
-        IEnumerable<AiChatMessage> chatMessages,
-        ChatOptions? options = null,
-        CancellationToken cancellationToken = default)
-    {
-        options ??= new ChatOptions();
-        options.AdditionalProperties ??= new AdditionalPropertiesDictionary();
-
-        if (!options.AdditionalProperties.ContainsKey("num_ctx"))
-        {
-            options.AdditionalProperties["num_ctx"] = numCtx;
-        }
-
-        return base.GetResponseAsync(chatMessages, options, cancellationToken);
-    }
-}
